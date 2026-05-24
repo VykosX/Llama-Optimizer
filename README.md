@@ -8,7 +8,7 @@ GP-Bayesian multi-phase optimization for `llama-server` (llama.cpp) and `ik_llam
 
 ## Table of Contents
 
-1. [Quick Start Guide](#quick-start-guide) — simplified, for everyone
+1. [Quick Start Guide](#quick-start-guide)
 2. [What This Does](#what-this-does)
 3. [Requirements](#requirements)
 4. [Installation](#installation)
