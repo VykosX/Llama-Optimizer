@@ -110,7 +110,7 @@ Press **Ctrl+C** at any time to skip the current phase and move to the next one.
 
 ## What This Does
 
-The LLM Batch Optimizer is a multi-phase automated benchmarking and optimization system for locally-run large language models. It works by:
+Llama Optimizer is a multi-phase automated benchmarking and optimization system for locally-run large language models. It works by:
 
 **Characterizing your hardware** — Before optimization begins, a topology sweep classifies each model into one of four cases based on how it fits in your VRAM, tests every relevant GPU configuration (single GPU, split across GPUs, NUMA policies), and binary-searches the maximum stable context window. This prevents the optimizer from wasting time on configurations that will OOM.
 
