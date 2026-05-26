@@ -217,6 +217,7 @@ def _load_config():
     parser.add_argument("--port", type=int, help="Server port")
     parser.add_argument("--config", help="Path to JSON config file")
     parser.add_argument("--dense", action="store_true", help="Dense model (skip MoE phases)")
+    parser.add_argument("--force-mtp", action="store_true", help="Force MTP draft sweep regardless of GGUF detection")
     args, _ = parser.parse_known_args()
 
     import copy
@@ -248,6 +249,8 @@ def _load_config():
         config["port"] = args.port
     if args.dense:
         config["architecture"]["type"] = "dense"
+    if args.force_mtp:
+        config["force_mtp"] = True
 
     # Layer 3: Auto-detect hardware if not explicitly set
     hw = config["hardware"]
@@ -272,6 +275,9 @@ IK_SERVER = Path("")          # empty Path = IK not available
 IK_MODE = False               # True when IK_SERVER is valid (pure IK or dual mode)
 DUAL_SERVER_MODE = False      # True when BOTH llama-server AND ik_llama-server are available
 MODEL = Path("model.gguf")
+MTP_AVAILABLE = False         # True when model has confirmed MTP heads
+MTP_FORCE = False             # True when --force-mtp is set
+MTP_LAYERS = 0                # nextn_predict_layers from GGUF
 CHAT_TEMPLATE = Path("")
 RESULTS_DIR = Path("results")
 LOOKUP_CACHE_FILE = str(RESULTS_DIR / "lookup-cache.bin")
@@ -298,7 +304,8 @@ _NO_JINJA = False   # injected by reinitialize(); adds --no-jinja to every serve
 
 def reinitialize(model_path, llama_server_path, results_dir, port=8090,
                  arch=None, max_gpu_layers=None, max_threads=None,
-                 no_jinja=False, chat_template=None, ik_server_path=None):
+                 no_jinja=False, chat_template=None, ik_server_path=None,
+                 force_mtp=False):
     global LLAMA_SERVER, IK_SERVER, IK_MODE, DUAL_SERVER_MODE
     global MODEL, CHAT_TEMPLATE, RESULTS_DIR, LOOKUP_CACHE_FILE
     global OPTUNA_DB, PORT, SERVER_URL, http, _config
@@ -306,6 +313,7 @@ def reinitialize(model_path, llama_server_path, results_dir, port=8090,
     global MAX_THREADS, MOE_SWEEP_MAX, MOE_SWEEP_CENTER
     global MAX_GPU_LAYERS, DEFAULT_GPU_LAYERS, NAKED_ENGINE
     global _quality_baseline, _NO_JINJA
+    global MTP_AVAILABLE, MTP_FORCE, MTP_LAYERS
 
     MODEL = Path(model_path)
     LLAMA_SERVER = Path(llama_server_path)
@@ -356,10 +364,28 @@ def reinitialize(model_path, llama_server_path, results_dir, port=8090,
     _quality_baseline = None
     _NO_JINJA = no_jinja
 
+    # MTP detection
+    MTP_FORCE = force_mtp
+    try:
+        from model_utils import detect_mtp as _detect_mtp
+        _mtp = _detect_mtp(MODEL)
+        MTP_AVAILABLE = _mtp["has_mtp"]
+        MTP_LAYERS = _mtp.get("mtp_layers", 0)
+        if MTP_AVAILABLE:
+            _src = _mtp.get("source", "unknown")
+            print(f"[*] MTP detected in model ({_src}): {MTP_LAYERS} prediction layer(s)")
+        elif _mtp.get("source") == "arch_hint":
+            print(f"[*] Model arch ({_mtp.get('arch')}) supports MTP but no MTP heads found in GGUF.")
+            print(f"    Use --force-mtp to run MTP phase anyway.")
+    except Exception as _e:
+        MTP_AVAILABLE = False
+        MTP_LAYERS = 0
+
     _config = {
         "server": str(LLAMA_SERVER), "model": str(MODEL),
         "ik_server": str(IK_SERVER) if IK_MODE else "",
         "ik_mode": IK_MODE, "dual_server_mode": DUAL_SERVER_MODE,
+        "mtp_available": MTP_AVAILABLE, "mtp_force": MTP_FORCE, "mtp_layers": MTP_LAYERS,
         "results_dir": str(RESULTS_DIR), "port": PORT,
         "architecture": ARCH,
         "hardware": {"max_threads": MAX_THREADS, "max_gpu_layers": MAX_GPU_LAYERS},
@@ -378,6 +404,8 @@ def _bootstrap_from_config():
         max_gpu_layers=hw.get("max_gpu_layers"),
         max_threads=hw.get("max_threads"),
         chat_template=cfg.get("chat_template", ""),
+        ik_server_path=cfg.get("ik_server", ""),
+        force_mtp=cfg.get("force_mtp", False),
     )
 
 
@@ -1274,6 +1302,14 @@ def start_server(engine_config):
         cmd.extend(["--draft-min", str(engine_config["draft_min"])])
     if "draft_p_min" in engine_config:
         cmd.extend(["--draft-p-min", str(engine_config["draft_p_min"])])
+    # MTP-specific draft flags (spec_draft_* keys used by phase_mtp)
+    # These map to the same llama.cpp flags as the ngram draft params above
+    if "spec_draft_n_max" in engine_config:
+        cmd.extend(["--draft", str(engine_config["spec_draft_n_max"])])
+    if "spec_draft_n_min" in engine_config:
+        cmd.extend(["--draft-min", str(engine_config["spec_draft_n_min"])])
+    if "spec_draft_p_min" in engine_config:
+        cmd.extend(["--draft-p-min", str(engine_config["spec_draft_p_min"])])
 
     # CPU placement
     if "cpu_strict" in engine_config:
@@ -1404,6 +1440,10 @@ def start_ik_server(engine_config):
     IK_SERVER binary instead of LLAMA_SERVER.  All other behaviour (stderr
     drain, env setup, debug print) is identical to start_server().
     """
+    if not IK_MODE or not IK_SERVER or not IK_SERVER.is_file():
+        print("  [!] start_ik_server() called but IK_SERVER not configured — "
+              "falling back to LLAMA_SERVER")
+        return start_server(engine_config)
     ik_cfg = dict(engine_config)
     ik_cfg["_ik_server"] = True
     # Swap the binary: temporarily patch LLAMA_SERVER global for the Popen call
@@ -1634,6 +1674,325 @@ def phase_ik_contrast(locked_compute=None, locked_moe=None, locked_memory=None):
         "all_trials": results,
     }
     save_phase_results("ik_contrast", output)
+    return output
+
+
+# ============================================================
+# MTP (Multi-Token Prediction) Phase
+# ============================================================
+
+# Global MTP state — set by reinitialize() when model is loaded.
+# is_mtp=True means the model has confirmed MTP heads (nextn_predict_layers in GGUF).
+MTP_AVAILABLE = False        # True when model has confirmed MTP heads
+MTP_FORCE = False            # True when --force-mtp CLI flag is set
+MTP_LAYERS = 0               # nextn_predict_layers value from GGUF (0 if forced/unknown)
+
+# MTP spec-type names — try both; older llama.cpp builds use "draft-mtp"
+# while newer ones use "mtp". We probe at phase start.
+_MTP_SPEC_TYPE = "mtp"       # overridden to "draft-mtp" if "mtp" fails
+
+
+def _probe_mtp_spec_type() -> str:
+    """Try launching with --spec-type mtp vs draft-mtp to find which this build supports.
+
+    Returns "mtp" or "draft-mtp". Falls back to "mtp" on any failure.
+    """
+    for spec_name in ("mtp", "draft-mtp"):
+        cfg = {**NAKED_ENGINE, "spec_type": spec_name, "spec_draft_n_max": 1}
+        proc = start_server(cfg)
+        if wait_for_server(proc=proc, timeout=60):
+            kill_server()
+            return spec_name
+        try:
+            lines = getattr(proc, "_stderr_lines", [])
+            combined = " ".join(lines)
+            # If server crashed with "unknown spec-type" it's the wrong name
+            if "unknown" in combined.lower() or "invalid" in combined.lower():
+                kill_server()
+                continue
+        except Exception:
+            pass
+        kill_server()
+    return "mtp"  # safe default
+
+
+def phase_mtp(locked_compute=None, locked_moe=None, locked_memory=None):
+    """MTP Phase: find optimal Multi-Token Prediction settings.
+
+    Only runs when the model has confirmed MTP heads (nextn_predict_layers in GGUF
+    metadata) or when MTP_FORCE is True (--force-mtp CLI switch).
+
+    What MTP is:
+      Instead of a separate draft model, MTP-capable GGUFs contain auxiliary
+      prediction heads trained alongside the main model. At inference, one forward
+      pass produces the main token PLUS N draft predictions; the drafts are verified
+      in parallel, effectively generating multiple tokens per pass when accepted.
+      No extra VRAM is needed for a separate draft model.
+
+    Parameters swept:
+      --spec-type mtp          fixed (or draft-mtp for older builds)
+      --spec-draft-n-max       1, 2, 3  (how many tokens to draft per step)
+      --spec-draft-n-min       0, 1     (minimum accepted draft tokens)
+      --spec-draft-p-min       0.3..0.95 (minimum acceptance probability threshold)
+      --ubatch-size            re-tested: MTP benefits from 512/1024 ubatch
+
+    Methodology:
+      1. Baseline: run best config WITHOUT MTP (3-run median)
+      2. Probe MTP spec-type ("mtp" vs "draft-mtp" depending on llama.cpp build)
+      3. Quick scan: test n_max = 1, 2, 3 with default p_min (all three, pick top 2)
+      4. p_min sweep on the top draft depth: 0.30, 0.50, 0.70, 0.85, 0.95
+      5. ubatch re-test on the best n_max/p_min combo: 256, 512, 1024
+      6. n_min test: 0 vs 1 on the best overall config
+      Final: re-validate winner with 5-run median for stability
+
+    Saves results to mtp_results.json.
+    Returns dict with best_config and speedup metrics, or None if MTP not available.
+    """
+    global _MTP_SPEC_TYPE
+
+    if not MTP_AVAILABLE and not MTP_FORCE:
+        print("\n[*] MTP not available for this model — skipping MTP phase.")
+        print("    Use --force-mtp to run anyway, or check that the GGUF contains MTP heads.")
+        return None
+
+    existing = load_phase_results("mtp_spec")
+    if existing and "mtp_best_tps" in existing:
+        print(f"\n[*] MTP phase already complete — "
+              f"best: {existing['mtp_best_tps']:.1f} t/s  "
+              f"gain: {existing.get('mtp_gain_pct', 0):+.1f}%  (from previous run)")
+        return existing
+
+    phase_start = time.time()
+    label = "MTP — Multi-Token Prediction"
+
+    print("\n" + "=" * 60)
+    print(f"  {label}")
+    print("=" * 60)
+    if MTP_FORCE and not MTP_AVAILABLE:
+        print(f"\n  [!] Force mode — MTP not confirmed in GGUF metadata")
+        print(f"      Running anyway as requested (--force-mtp)")
+    else:
+        print(f"\n  MTP layers in model: {MTP_LAYERS}")
+    print(f"  Model arch: {ARCH.get('type', 'unknown')}")
+
+    # ── Build base config from best known results ─────────────────────────────
+    base = dict(NAKED_ENGINE)
+    if locked_moe:
+        base.update(locked_moe)
+    if locked_compute:
+        base.update({k: v for k, v in locked_compute.items() if v is not None})
+    if locked_memory:
+        mem = dict(locked_memory)
+        if "kv_cache_type" in mem:
+            kv = mem.pop("kv_cache_type")
+            mem["cache_type_k"] = kv
+            mem["cache_type_v"] = kv
+        base.update({k: v for k, v in mem.items() if v is not None})
+    # MTP requires flash attention
+    base["flash_attn"] = "on"
+    # Remove any existing ngram speculation — MTP replaces it
+    for k in ("spec_type", "spec_ngram_n", "spec_ngram_m", "spec_ngram_min_hits",
+              "draft_max", "draft_min", "draft_p_min", "lookup_cache_dynamic",
+              "spec_draft_n_max", "spec_draft_n_min", "spec_draft_p_min"):
+        base.pop(k, None)
+    base = {k: v for k, v in base.items() if v is not None}
+
+    results = []
+
+    def _bench(cfg, label_str, runs=3):
+        """Start server with cfg, benchmark, stop, return (perf_dict | None)."""
+        print(f"\n  [{label_str}]")
+        kill_server()
+        proc = start_server(cfg)
+        if not wait_for_server(proc=proc):
+            reason = ""
+            try:
+                lines = getattr(proc, "_stderr_lines", [])
+                for line in reversed(lines):
+                    ls = line.strip()
+                    if ls and any(w in ls.lower() for w in
+                                  ("error", "failed", "abort", "oom", "alloc",
+                                   "cuda", "memory", "unknown", "invalid", "assert")):
+                        reason = f" → {ls[:100]}"
+                        break
+            except Exception:
+                pass
+            print(f"    FAILED{reason}")
+            proc.kill()
+            results.append({"label": label_str, "status": "failed", "tps": 0.0})
+            return None
+        perf = measure_perf(runs=runs)
+        large = _measure_perf_large()
+        if large:
+            perf.update(large)
+        score = compute_score(perf)
+        tps = perf["tps"]
+        tps_long = perf.get("tps_long", 0)
+        print(f"    {tps:.1f} t/s  (long: {tps_long:.1f} t/s)  "
+              f"pp: {perf['prompt_tps']:.0f} t/s  TTFT: {perf['ttft']:.0f}ms  score: {score:.1f}")
+        results.append({
+            "label": label_str,
+            "status": "ok",
+            "tps": round(tps, 2),
+            "tps_long": round(tps_long, 2),
+            "prompt_tps": round(perf["prompt_tps"], 2),
+            "ttft": round(perf["ttft"], 1),
+            "score": round(score, 2),
+        })
+        kill_server()
+        return perf
+
+    # ── Step 1: baseline (no MTP) ─────────────────────────────────────────────
+    print(f"\n  Step 1/6 — Baseline (no MTP)")
+    baseline_perf = _bench(base, "baseline (no MTP)", runs=3)
+    baseline_tps = baseline_perf["tps"] if baseline_perf else 0.0
+    if baseline_tps == 0:
+        print("  [!] Baseline failed — cannot run MTP phase")
+        return None
+
+    # ── Step 2: probe spec-type ───────────────────────────────────────────────
+    print(f"\n  Step 2/6 — Probing MTP spec-type (mtp vs draft-mtp)...")
+    _MTP_SPEC_TYPE = _probe_mtp_spec_type()
+    print(f"    Detected spec-type: --spec-type {_MTP_SPEC_TYPE}")
+
+    # ── Step 3: n_max quick scan 1, 2, 3 ─────────────────────────────────────
+    print(f"\n  Step 3/6 — Draft depth scan (n_max = 1, 2, 3)")
+    nmax_results = {}
+    for n_max in (1, 2, 3):
+        cfg = {**base,
+               "spec_type": _MTP_SPEC_TYPE,
+               "spec_draft_n_max": n_max,
+               "spec_draft_n_min": 0,
+               "spec_draft_p_min": 0.0}
+        perf = _bench(cfg, f"MTP n_max={n_max}", runs=3)
+        nmax_results[n_max] = perf["tps"] if perf else 0.0
+
+    # Pick top 2 n_max values by TPS
+    top_nmax = sorted(nmax_results, key=nmax_results.get, reverse=True)[:2]
+    best_nmax = top_nmax[0]
+    print(f"\n  Top draft depths: {top_nmax}  (best: n_max={best_nmax} "
+          f"at {nmax_results[best_nmax]:.1f} t/s)")
+
+    # If MTP never beats baseline at any n_max, abort early
+    if max(nmax_results.values()) <= baseline_tps * 0.98:
+        print(f"\n  [!] MTP did not improve over baseline "
+              f"({max(nmax_results.values()):.1f} vs {baseline_tps:.1f} t/s)")
+        print(f"      This model's MTP heads may not be effective at current settings.")
+        print(f"      Continuing p_min sweep — may still find gains with tuning.")
+
+    # ── Step 4: p_min sweep on best n_max ─────────────────────────────────────
+    print(f"\n  Step 4/6 — Acceptance probability sweep (spec-draft-p-min) on n_max={best_nmax}")
+    # p_min controls how selective the drafter is. Higher p_min = fewer but better drafts.
+    # The sweet spot varies by model and content type; empirically 0.5-0.85 wins most often.
+    pmin_results = {}
+    for p_min in (0.0, 0.30, 0.50, 0.70, 0.85, 0.95):
+        cfg = {**base,
+               "spec_type": _MTP_SPEC_TYPE,
+               "spec_draft_n_max": best_nmax,
+               "spec_draft_n_min": 0,
+               "spec_draft_p_min": p_min}
+        perf = _bench(cfg, f"MTP p_min={p_min:.2f}", runs=3)
+        pmin_results[p_min] = perf["tps"] if perf else 0.0
+
+    best_pmin = max(pmin_results, key=pmin_results.get)
+    print(f"\n  Best p_min: {best_pmin:.2f} at {pmin_results[best_pmin]:.1f} t/s")
+
+    # ── Step 5: ubatch re-test on best n_max + p_min ──────────────────────────
+    print(f"\n  Step 5/6 — ubatch sweep on best MTP config (n_max={best_nmax}, p_min={best_pmin:.2f})")
+    # MTP verifies N draft tokens in a single forward pass — larger ubatch helps
+    ubatch_results = {}
+    for ub in (256, 512, 1024):
+        cfg = {**base,
+               "ubatch_size": ub,
+               "spec_type": _MTP_SPEC_TYPE,
+               "spec_draft_n_max": best_nmax,
+               "spec_draft_n_min": 0,
+               "spec_draft_p_min": best_pmin}
+        perf = _bench(cfg, f"MTP ubatch={ub}", runs=3)
+        ubatch_results[ub] = perf["tps"] if perf else 0.0
+
+    best_ubatch = max(ubatch_results, key=ubatch_results.get)
+    print(f"\n  Best ubatch: {best_ubatch} at {ubatch_results[best_ubatch]:.1f} t/s")
+
+    # ── Step 6: n_min test (0 vs 1) ──────────────────────────────────────────
+    print(f"\n  Step 6/6 — n_min test (min accepted draft tokens: 0 vs 1)")
+    nmin_results = {}
+    for n_min in (0, 1):
+        cfg = {**base,
+               "ubatch_size": best_ubatch,
+               "spec_type": _MTP_SPEC_TYPE,
+               "spec_draft_n_max": best_nmax,
+               "spec_draft_n_min": n_min,
+               "spec_draft_p_min": best_pmin}
+        perf = _bench(cfg, f"MTP n_min={n_min}", runs=3)
+        nmin_results[n_min] = perf["tps"] if perf else 0.0
+
+    best_nmin = max(nmin_results, key=nmin_results.get)
+
+    # ── Final validation — 5-run median on overall winner ────────────────────
+    best_cfg = {**base,
+                "ubatch_size": best_ubatch,
+                "spec_type": _MTP_SPEC_TYPE,
+                "spec_draft_n_max": best_nmax,
+                "spec_draft_n_min": best_nmin,
+                "spec_draft_p_min": best_pmin}
+    print(f"\n  Final validation (5 runs) on best config...")
+    final_perf = _bench(best_cfg,
+                        f"FINAL: n_max={best_nmax} n_min={best_nmin} "
+                        f"p_min={best_pmin:.2f} ubatch={best_ubatch}", runs=5)
+    mtp_best_tps = final_perf["tps"] if final_perf else max(nmin_results.values())
+
+    mtp_gain_pct = (mtp_best_tps - baseline_tps) / baseline_tps * 100 if baseline_tps > 0 else 0.0
+
+    # ── Summary ───────────────────────────────────────────────────────────────
+    elapsed = time.time() - phase_start
+    print(f"\n{'=' * 60}")
+    print(f"  {label} — RESULTS")
+    print(f"{'=' * 60}")
+    print(f"  Baseline (no MTP): {baseline_tps:.1f} t/s")
+    print(f"  Best MTP config:   {mtp_best_tps:.1f} t/s  ({mtp_gain_pct:+.1f}%)")
+    print(f"    --spec-type {_MTP_SPEC_TYPE}")
+    print(f"    --spec-draft-n-max {best_nmax}")
+    print(f"    --spec-draft-n-min {best_nmin}")
+    print(f"    --spec-draft-p-min {best_pmin:.2f}")
+    print(f"    --ubatch-size {best_ubatch}")
+    if mtp_gain_pct < 0:
+        print(f"\n  [!] MTP was slower than baseline on this model/hardware.")
+        print(f"      This can happen when VRAM is nearly full (MTP heads need ~2–5% extra)")
+        print(f"      or when the model was not trained with strong MTP objectives.")
+    elif mtp_gain_pct < 10:
+        print(f"\n  [~] Modest MTP gain. Dense models typically see 20–70%; this is lower.")
+        print(f"      MoE models see smaller gains as expert routing already reduces compute.")
+    else:
+        print(f"\n  [+] Strong MTP gain! MTP is recommended for this model.")
+    print(f"  Duration: {elapsed / 60:.1f} min")
+
+    output = {
+        "phase": "mtp_spec",
+        "mtp_available": MTP_AVAILABLE,
+        "mtp_force": MTP_FORCE,
+        "mtp_layers": MTP_LAYERS,
+        "spec_type_used": _MTP_SPEC_TYPE,
+        "baseline_tps": round(baseline_tps, 2),
+        "mtp_best_tps": round(mtp_best_tps, 2),
+        "mtp_gain_pct": round(mtp_gain_pct, 1),
+        "best_params": {
+            "spec_type": _MTP_SPEC_TYPE,
+            "spec_draft_n_max": best_nmax,
+            "spec_draft_n_min": best_nmin,
+            "spec_draft_p_min": best_pmin,
+            "ubatch_size": best_ubatch,
+        },
+        "sweep_results": {
+            "n_max_scan":   {str(k): round(v, 2) for k, v in nmax_results.items()},
+            "p_min_sweep":  {str(k): round(v, 2) for k, v in pmin_results.items()},
+            "ubatch_sweep": {str(k): round(v, 2) for k, v in ubatch_results.items()},
+            "n_min_test":   {str(k): round(v, 2) for k, v in nmin_results.items()},
+        },
+        "duration_seconds": round(elapsed, 1),
+        "all_trials": results,
+    }
+    save_phase_results("mtp_spec", output)
     return output
 
 
@@ -3276,7 +3635,7 @@ def phase3(n_trials=80):
 # Full Pipeline
 # ============================================================
 
-def run_full_pipeline(trials_moe=50, trials_p1b=60, trials_p2=60, trials_p1c=60, trials_p2b=60, trials_p3=80, include_ik=True):
+def run_full_pipeline(trials_moe=50, trials_p1b=60, trials_p2=60, trials_p1c=60, trials_p2b=60, trials_p3=80, include_ik=True, include_mtp=True):
     """Run all phases in sequence with result chaining."""
     print("\n" + "=" * 60)
     print("  FULL OPTIMIZATION PIPELINE")
@@ -3290,6 +3649,8 @@ def run_full_pipeline(trials_moe=50, trials_p1b=60, trials_p2=60, trials_p1c=60,
     print(f"  Quality:        {trials_p3} trials (sampling)")
     if IK_MODE and include_ik:
         print(f"  IK Contrast:    MLA/fused-MoE/RTR/SER sweep")
+    if (MTP_AVAILABLE or MTP_FORCE) and include_mtp:
+        print(f"  MTP Sweep:      draft-n-max / p-min / ubatch")
     print("=" * 60)
 
     print("\n  Tip: Press Ctrl+C to skip the current phase\n")
@@ -3362,11 +3723,22 @@ def run_full_pipeline(trials_moe=50, trials_p1b=60, trials_p2=60, trials_p1c=60,
             locked_memory=final_memory,
         ))
 
+    # MTP Sweep (optional — runs last, uses best compute+memory config)
+    if (MTP_AVAILABLE or MTP_FORCE) and include_mtp:
+        final_compute = p1c_best or p1b_best
+        final_memory = p2b_best
+        _run_phase("MTP Sweep", lambda: phase_mtp(
+            locked_compute=final_compute,
+            locked_moe=best_moe,
+            locked_memory=final_memory,
+        ))
+
     # Final summary
     print("\n" + "=" * 60)
     print("  FULL PIPELINE COMPLETE")
     print("=" * 60)
-    for name in ["gpu", "moe_combined", "compute", "memory", "compute_audit", "moe_audit", "memory_audit", "quality", "ik_contrast"]:
+    for name in ["gpu", "moe_combined", "compute", "memory", "compute_audit",
+                 "moe_audit", "memory_audit", "quality", "ik_contrast", "mtp_spec"]:
         data = load_phase_results(name)
         if data:
             if "best_ngl" in data:
@@ -3374,6 +3746,9 @@ def run_full_pipeline(trials_moe=50, trials_p1b=60, trials_p2=60, trials_p1c=60,
             elif "ik_best_tps" in data:
                 print(f"  {name:12s}: IK best {data['ik_best_tps']:.1f} t/s  "
                       f"(gain vs llama: {data.get('ik_gain_vs_llama_pct', 0):+.1f}%)")
+            elif "mtp_best_tps" in data:
+                print(f"  {name:12s}: MTP best {data['mtp_best_tps']:.1f} t/s  "
+                      f"(gain: {data.get('mtp_gain_pct', 0):+.1f}%)")
             elif "best_tps" in data:
                 print(f"  {name:12s}: {data['best_tps']:.1f} t/s")
             elif "best_score" in data:
@@ -3509,6 +3884,12 @@ def print_header():
         print(f"  IK:     {IK_SERVER.name}  [{ik_label}]")
     else:
         print(f"  IK:     not configured (set IK_LLAMA_SERVER env var to enable)")
+    if MTP_AVAILABLE:
+        print(f"  MTP:    enabled — {MTP_LAYERS} prediction layer(s) in GGUF")
+    elif MTP_FORCE:
+        print(f"  MTP:    force mode active (--force-mtp)")
+    else:
+        print(f"  MTP:    not detected (use --force-mtp to override)")
     print("=" * 60)
 
 
@@ -3526,12 +3907,16 @@ def print_menu():
     print("  [s]   Quality / sampling (+ best)")
     if IK_MODE:
         print("  [ik]  IK_llama contrast (MLA/fused-MoE/RTR/SER sweep)")
+    if MTP_AVAILABLE or MTP_FORCE:
+        print("  [mtp] MTP draft sweep (spec-draft-n-max/p-min/ubatch)")
     print()
     print("  Pipelines:")
     print("  [all] Full pipeline (GPU → MoE → C → ME → MO → CA → MA → Q)")
     print("  [cd]  Coordinate descent (GPU → MoE → C → ME → MO → CA → MA)")
     if IK_MODE:
         print("  [ikall] IK-extended pipeline (adds IK contrast at end)")
+    if MTP_AVAILABLE or MTP_FORCE:
+        print("  [mtpall] MTP-extended pipeline (adds MTP sweep at end)")
     print()
     print("  [v] View past results")
     print("  [m] Switch model")
@@ -3586,7 +3971,8 @@ def reset_db():
             db_path.unlink()
         # Also clean up result JSONs
         for name in ["moe_combined", "moe", "experts", "compute", "memory",
-                     "compute_audit", "moe_audit", "memory_audit", "quality", "ik_contrast"]:
+                     "compute_audit", "moe_audit", "memory_audit", "quality",
+                     "ik_contrast", "mtp_spec"]:
             p = RESULTS_DIR / f"{name}_results.json"
             if p.exists():
                 p.unlink()
@@ -3600,11 +3986,21 @@ def view_results():
     """Show saved results from previous runs."""
     print()
     for name in ["moe_combined", "moe", "experts", "compute", "memory",
-                 "compute_audit", "moe_audit", "memory_audit", "quality", "ik_contrast"]:
+                 "compute_audit", "moe_audit", "memory_audit", "quality",
+                 "ik_contrast", "mtp_spec"]:
         data = load_phase_results(name)
         if data:
             print(f"  --- {name} ---")
-            if name == "ik_contrast":
+            if name == "mtp_spec":
+                print(f"  baseline:   {data.get('baseline_tps', 0):.1f} t/s")
+                print(f"  MTP best:   {data.get('mtp_best_tps', 0):.1f} t/s  "
+                      f"(gain: {data.get('mtp_gain_pct', 0):+.1f}%)")
+                bp = data.get("best_params", {})
+                print(f"  Best params: --spec-type {bp.get('spec_type', '?')} "
+                      f"--spec-draft-n-max {bp.get('spec_draft_n_max', '?')} "
+                      f"--spec-draft-p-min {bp.get('spec_draft_p_min', '?')} "
+                      f"--ubatch-size {bp.get('ubatch_size', '?')}")
+            elif name == "ik_contrast":
                 print(f"  llama.cpp:  {data.get('llama_tps', 0):.1f} t/s")
                 print(f"  IK best:    {data.get('ik_best_tps', 0):.1f} t/s  [{data.get('ik_best_label', '')}]")
                 print(f"  IK gain:    {data.get('ik_gain_vs_llama_pct', 0):+.1f}% vs llama  "
@@ -3931,12 +4327,26 @@ def main():
                 mem = p2["best_params"] if p2 else None
                 phase_ik_contrast(locked_compute=compute, locked_moe=moe, locked_memory=mem)
                 input("\n  Press Enter to continue...")
+        elif choice == "mtp":
+            if not MTP_AVAILABLE and not MTP_FORCE:
+                print("  [!] MTP not detected in this model.")
+                print("      Use --force-mtp flag or set IK_LLAMA_SERVER if using ik_llama.")
+                input("  Press Enter to continue...")
+            else:
+                p1a = load_phase_results("moe_combined")
+                p1b = load_phase_results("compute_audit") or load_phase_results("compute")
+                p2 = load_phase_results("memory_audit") or load_phase_results("memory")
+                moe = _get_moe_config(p1a)
+                compute = p1b["best_params"] if p1b else None
+                mem = p2["best_params"] if p2 else None
+                phase_mtp(locked_compute=compute, locked_moe=moe, locked_memory=mem)
+                input("\n  Press Enter to continue...")
         elif choice == "cd":
             n_1b = ask_trials("Compute", 60)
             n_2 = ask_trials("Memory", 60)
             n_1c = ask_trials("Compute Audit", 60)
             n_2b = ask_trials("Memory Audit", 60)
-            run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, 0, include_ik=False)  # 0 trials = skip Quality
+            run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, 0, include_ik=False, include_mtp=False)
             input("\n  Press Enter to continue...")
         elif choice in ("all", "12345"):
             n_1b = ask_trials("Compute", 60)
@@ -3944,7 +4354,7 @@ def main():
             n_1c = ask_trials("Compute Audit", 60)
             n_2b = ask_trials("Memory Audit", 60)
             n_3 = ask_trials("Quality", 80)
-            run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, n_3, include_ik=False)
+            run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, n_3, include_ik=False, include_mtp=False)
             input("\n  Press Enter to continue...")
         elif choice == "ikall":
             if not IK_MODE:
@@ -3956,7 +4366,19 @@ def main():
                 n_1c = ask_trials("Compute Audit", 60)
                 n_2b = ask_trials("Memory Audit", 60)
                 n_3 = ask_trials("Quality", 80)
-                run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, n_3, include_ik=True)
+                run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, n_3, include_ik=True, include_mtp=False)
+                input("\n  Press Enter to continue...")
+        elif choice == "mtpall":
+            if not MTP_AVAILABLE and not MTP_FORCE:
+                print("  [!] MTP not detected. Use --force-mtp or confirm model has MTP heads.")
+                input("  Press Enter to continue...")
+            else:
+                n_1b = ask_trials("Compute", 60)
+                n_2 = ask_trials("Memory", 60)
+                n_1c = ask_trials("Compute Audit", 60)
+                n_2b = ask_trials("Memory Audit", 60)
+                n_3 = ask_trials("Quality", 80)
+                run_full_pipeline(50, n_1b, n_2, n_1c, n_2b, n_3, include_ik=False, include_mtp=True)
                 input("\n  Press Enter to continue...")
         else:
             print("  Invalid choice.")

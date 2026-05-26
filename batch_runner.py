@@ -11,6 +11,9 @@ Usage:
   python batch_runner.py --preset quick --skip-phases moe gpu
   python batch_runner.py --report-only --html-report
 
+Checkpoint A (independent LLM_Optimiser_lmstudio.py path) is preserved at:
+  /home/claude/checkpoint_a.json
+  /home/claude/LLM_Optimiser_lmstudio.py
 """
 
 from __future__ import annotations
@@ -372,6 +375,11 @@ def read_best_result_new(model_path: Path, results_base: Path,
         "ik_gain_vs_llama_pct":  0.0,
         "ik_best_label":         "",
         "ik_available":          False,
+        # MTP fields
+        "mtp_best_tps":          0.0,
+        "mtp_gain_pct":          0.0,
+        "mtp_best_label":        "",
+        "mtp_available":         False,
     }
 
     # Try each phase in priority order for the best TPS
@@ -429,6 +437,21 @@ def read_best_result_new(model_path: Path, results_base: Path,
             result["ik_gain_vs_llama_pct"] = ik_d.get("ik_gain_vs_llama_pct", 0.0)
             result["ik_best_label"]        = ik_d.get("ik_best_label", "")
             result["ik_available"]         = True
+        except Exception:
+            pass
+
+    # MTP sweep results
+    mtp_p = d / "mtp_spec_results.json"
+    if mtp_p.exists():
+        try:
+            mtp_d = json.loads(mtp_p.read_text(encoding="utf-8"))
+            result["mtp_best_tps"]   = mtp_d.get("mtp_best_tps", 0.0)
+            result["mtp_gain_pct"]   = mtp_d.get("mtp_gain_pct", 0.0)
+            bp = mtp_d.get("best_params", {})
+            result["mtp_best_label"] = (f"n_max={bp.get('spec_draft_n_max','?')} "
+                                        f"p_min={bp.get('spec_draft_p_min','?')} "
+                                        f"ub={bp.get('ubatch_size','?')}")
+            result["mtp_available"]  = True
         except Exception:
             pass
 
@@ -495,7 +518,8 @@ def save_batch_report(results: list[dict], reports_dir: Path, models_dir: Path =
                   "improvement_pct", "best_score", "topo_case", "topo_winner",
                   "ctx_gpu", "ctx_ram", "recommended_ctx", "best_config",
                   "current_quant", "estimated_fp16_gb",
-                  "ik_best_tps", "ik_gain_vs_llama_pct", "ik_best_label"]
+                  "ik_best_tps", "ik_gain_vs_llama_pct", "ik_best_label",
+                  "mtp_best_tps", "mtp_gain_pct", "mtp_best_label"]
     ok = sorted([r for r in results if r.get("status") == "ok"],
                 key=lambda r: r.get("best_gen_tps", 0), reverse=True)
     with open(csv_path, "w", newline="", encoding="utf-8") as f:
@@ -520,9 +544,10 @@ def print_batch_report(results: list[dict]):
     # Header
     hdr = (f"  {'#':>3}  {'Model':<36} {'Quant':<8} {'Case':<6}"
            f" {'Stock':>7} {'Best':>7} {'Gain':>6}"
-           f" {'IK t/s':>7} {'IK gain':>8}  {'Topo winner':<22}")
+           f" {'IK t/s':>7} {'IK gain':>8}"
+           f" {'MTP t/s':>8} {'MTP gain':>9}  {'Topo winner':<22}")
     print(hdr)
-    print(f"  {'─'*3}  {'─'*36} {'─'*8} {'─'*6} {'─'*7} {'─'*7} {'─'*6} {'─'*7} {'─'*8}  {'─'*22}")
+    print(f"  {'─'*3}  {'─'*36} {'─'*8} {'─'*6} {'─'*7} {'─'*7} {'─'*6} {'─'*7} {'─'*8} {'─'*8} {'─'*9}  {'─'*22}")
     for i, r in enumerate(ok, 1):
         name  = (r["model"][:37] + "…") if len(r["model"]) > 38 else r["model"]
         quant = (r.get("current_quant") or "?")[:7]
@@ -532,10 +557,13 @@ def print_batch_report(results: list[dict]):
         gain  = f"{r['improvement_pct']:+.0f}%" if r.get("baseline_gen_tps") else "n/a"
         ik_tps  = f"{r['ik_best_tps']:.1f}"  if r.get("ik_best_tps")         else "—"
         ik_gain = f"{r['ik_gain_vs_llama_pct']:+.0f}%" if r.get("ik_available") else "—"
+        mtp_tps  = f"{r['mtp_best_tps']:.1f}" if r.get("mtp_best_tps")        else "—"
+        mtp_gain = f"{r['mtp_gain_pct']:+.0f}%" if r.get("mtp_available")      else "—"
         topo  = (r.get("topo_winner") or "not tested")[:22]
         print(f"  {i:>3}. {name:<36} {quant:<8} {case:<6}"
               f" {stock:>7} {best:>7} {gain:>6}"
-              f" {ik_tps:>7} {ik_gain:>8}  {topo:<22}")
+              f" {ik_tps:>7} {ik_gain:>8}"
+              f" {mtp_tps:>8} {mtp_gain:>9}  {topo:<22}")
     if failed:
         print(f"\n  No-result models ({len(failed)}):")
         for r in failed:
@@ -638,6 +666,8 @@ def main():
     g.add_argument("--reports-dir",   default=str(DEFAULT_REPORTS_DIR))
     g.add_argument("--logs-dir",      default=str(DEFAULT_LOGS_DIR),
                    help="Folder for log files (default: ./logs)")
+    g.add_argument("--force-mtp",     action="store_true",
+                   help="Force MTP draft sweep even when MTP heads are not detected in GGUF metadata")
 
     g = parser.add_argument_group("model selection")
     g.add_argument("--filter",  default=None,
@@ -851,6 +881,10 @@ def main():
         print(f"  ik-server   : {ik_server_path}  [{_ik_mode_str}]")
     else:
         print(f"  ik-server   : not configured (set IK_LLAMA_SERVER or --ik-llama-server)")
+    if getattr(args, "force_mtp", False):
+        print(f"  MTP         : FORCED (--force-mtp)")
+    else:
+        print(f"  MTP         : auto-detected from GGUF metadata per model")
     print(f"  Results base: {results_base}")
     print(f"  Logs dir    : {logs_dir}")
     print(f"  Preset      : {args.preset} -- {PRESETS[args.preset]['description']}")
@@ -1076,6 +1110,7 @@ def main():
                     ctx_recommended=ctx_recommended,
                     resume=args.resume,
                     ik_server_path=ik_server_path,
+                    force_mtp=getattr(args, "force_mtp", False),
                 )
                 status = model_result.status
                 error  = model_result.error

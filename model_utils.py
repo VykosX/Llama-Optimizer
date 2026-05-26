@@ -223,6 +223,66 @@ def kv_cache_mb_per_token(meta: dict) -> float:
             * meta["head_dim"] * 2 * 2) / (1024 * 1024)
 
 
+# ---------------------------------------------------------------------------
+# MTP (Multi-Token Prediction) detection
+# ---------------------------------------------------------------------------
+
+# GGUF metadata key that signals built-in MTP heads: {arch}.nextn_predict_layers
+# Present in: Qwen3.5/3.6 (arch=qwen35), DeepSeek V3/R1 (arch=deepseek3/deepseek2),
+#             Gemma 4 (arch=gemma4)
+_MTP_META_KEY_SUFFIX = ".nextn_predict_layers"
+
+# Filename substrings that indicate an MTP-capable GGUF when metadata is unavailable
+_MTP_FILENAME_PATTERNS = [
+    re.compile(r'[-_\.]mtp[-_\.]', re.IGNORECASE),
+    re.compile(r'[-_]mtp[-_\.]', re.IGNORECASE),
+    re.compile(r'[-_\.]mtp$', re.IGNORECASE),
+    re.compile(r'-MTP-', re.IGNORECASE),
+    re.compile(r'\.mtp\.', re.IGNORECASE),
+]
+
+# Architectures known to support MTP training (heads may or may not be in GGUF)
+_MTP_CAPABLE_ARCHS = {"qwen35", "deepseek3", "deepseek2", "gemma4"}
+
+
+def detect_mtp(model_path: Path) -> dict:
+    """Detect whether a GGUF model has built-in MTP (Multi-Token Prediction) heads.
+
+    Detection cascade (most reliable to least):
+      1. GGUF metadata key  {arch}.nextn_predict_layers  -- definitive
+      2. Filename pattern matching (-MTP-, .mtp., etc.)  -- probable
+      3. Architecture in _MTP_CAPABLE_ARCHS              -- possible (needs confirmation)
+
+    Returns dict with keys:
+      has_mtp (bool), mtp_layers (int), source (str), arch (str), confidence (str)
+    """
+    meta = _cached_meta(model_path)
+    arch = meta.get("arch", "")
+    stem = model_path.stem
+
+    # Tier 1: definitive -- GGUF metadata contains nextn_predict_layers
+    raw = read_gguf_metadata(model_path)
+    for k, v in raw.items():
+        if k.endswith(_MTP_META_KEY_SUFFIX) and not k.startswith("_"):
+            n = int(v) if v else 1
+            return {"has_mtp": n > 0, "mtp_layers": n, "source": "metadata",
+                    "arch": arch, "confidence": "high"}
+
+    # Tier 2: filename pattern
+    for pat in _MTP_FILENAME_PATTERNS:
+        if pat.search(stem):
+            return {"has_mtp": True, "mtp_layers": 1, "source": "filename",
+                    "arch": arch, "confidence": "medium"}
+
+    # Tier 3: architecture hint (family supports MTP but this GGUF may lack heads)
+    if arch.lower() in _MTP_CAPABLE_ARCHS:
+        return {"has_mtp": False, "mtp_layers": 0, "source": "arch_hint",
+                "arch": arch, "confidence": "low"}
+
+    return {"has_mtp": False, "mtp_layers": 0, "source": "none",
+            "arch": arch, "confidence": "high"}
+
+
 _META_CACHE: dict[str, dict] = {}
 
 def _cached_meta(model_path: Path) -> dict:

@@ -2434,6 +2434,8 @@ def render_html(results: list, report_meta: dict, output_path: Path):
   <th data-col="api_cost"        class="ref-col">$/1M tok<span class="col-tip">Blended API cost in USD per 1 million tokens (3:1 input:output). Only available for reference API models.</span></th>
   <th data-col="detail" class="ref-col"></th>
   <th data-col="ik_best_tps">IK t/s<span class="col-tip">Best tokens/second achieved by ik_llama.cpp on this model, using the optimal combination of MLA attention (-mla 2), fused MoE (-fmoe), run-time repack (-rtr), and attn-max-batch (-amb) flags. Measured after the llama.cpp optimization pipeline completes. Only populated when IK_LLAMA_SERVER is configured.</span></th>
+  <th data-col="mtp_best_tps">MTP t/s<span class="col-tip">Best tokens/second achieved with Multi-Token Prediction (MTP) enabled. MTP uses auxiliary prediction heads baked into the GGUF itself — no separate draft model needed. Each forward pass predicts the main token plus N draft tokens verified in parallel. Only available for models with nextn_predict_layers in their GGUF metadata (Qwen3.5/3.6, DeepSeek V3/R1, Gemma 4). Use --force-mtp to test any model.</span></th>
+  <th data-col="mtp_gain">MTP gain<span class="col-tip">Speed gain of the best MTP configuration vs the same model without MTP, as a percentage. Dense models typically see 20–70% gains; MoE models see smaller gains (5–25%) because expert routing already reduces per-step compute. Negative values mean MTP was counterproductive on this hardware (usually indicates near-full VRAM — MTP heads require ~2–5% extra).</span></th>
   <th data-col="ik_gain">IK gain<span class="col-tip">Speed gain of the best ik_llama.cpp config vs the best vanilla llama.cpp config, as a percentage. Positive = IK is faster. Key IK advantages: fused MoE routing (+20–80% on MoE models), run-time quant repacking for CPU-offloaded experts (+50–80% on hybrid GPU/CPU configs), and MLA attention for DeepSeek-architecture models (-50% KV cache, meaningful throughput boost). Zero or blank = IK contrast not yet run.</span></th>
   <th data-col="detail" class="ref-col"></th>
   <th data-col="detail"></th>
@@ -2526,6 +2528,8 @@ function sv(row, col) {{
     case "best_flash":       return row.best_flash_attn || null;
     case "ik_best_tps":      return row.ik_best_tps  > 0 ? row.ik_best_tps  : null;
     case "ik_gain":          return row.ik_available  ? row.ik_gain_vs_llama_pct : null;
+    case "mtp_best_tps":     return row.mtp_best_tps > 0 ? row.mtp_best_tps : null;
+    case "mtp_gain":         return row.mtp_available ? row.mtp_gain_pct : null;
     default:                 return row[col] != null ? row[col] : null;
   }}
 }}
@@ -2788,6 +2792,29 @@ function buildRow(row, idx) {{
     + '<td class="num ref-col">' + (hf.api_cost_per_mtok != null ? "$" + hf.api_cost_per_mtok.toFixed(2) : '<span class="na">—</span>') + '</td>'
     + '<td class="ref-col"></td>'
     + (function() {{
+        // ── MTP columns ────────────────────────────────────────────────────
+        (function() {{
+          var mtpTps   = row.mtp_best_tps;
+          var mtpGain  = row.mtp_gain_pct;
+          var mtpAvail = row.mtp_available;
+          var mtpLabel = row.mtp_best_label || "";
+          var mtpTip   = mtpAvail && mtpLabel
+              ? ' title="' + esc("MTP best: " + mtpLabel) + '"'
+              : (mtpAvail ? "" : ' title="MTP not run — use --preset mtp or --force-mtp"');
+          var mtpColor = !mtpAvail ? "var(--text2)"
+              : mtpGain > 5  ? "var(--green)"
+              : mtpGain < 0  ? "var(--red)"
+              : "var(--yellow)";
+          var mtpTpsCell  = mtpAvail && mtpTps > 0
+              ? '<span' + mtpTip + ' style="font-weight:600">' + mtpTps.toFixed(1) + " t/s</span>"
+              : '<span class="na"' + mtpTip + '>—</span>';
+          var mtpGainCell = mtpAvail
+              ? '<span style="font-weight:600;color:' + mtpColor + '">' + (mtpGain >= 0 ? "+" : "") + mtpGain.toFixed(1) + "%</span>"
+              : '<span class="na"' + mtpTip + '>—</span>';
+          html += '<td class="num">' + mtpTpsCell  + '</td>'
+               +  '<td class="num">' + mtpGainCell + '</td>';
+        }})();
+
         // ── IK_llama.cpp contrast columns ─────────────────────────────────
         var ikTps    = row.ik_best_tps;
         var ikGain   = row.ik_gain_vs_llama_pct;
@@ -2862,6 +2889,17 @@ function buildRow(row, idx) {{
               + (row.ik_gain_vs_llama_pct >= 0 ? "+" : "") + row.ik_gain_vs_llama_pct.toFixed(1) + '%</span></div>'
             : '<div class="kv-row"><span>IK result</span><span class="na">No data</span></div>';
         return '<div class="detail-section"><h4>IK_llama.cpp Contrast</h4>' + ikR + '</div>';
+      }})()
+    + (function() {{
+        if (!row.mtp_available) return '';
+        var bp = row.mtp_best_label || "—";
+        var mtpR = row.mtp_best_tps > 0
+            ? '<div class="kv-row"><span>MTP best t/s</span><span style="color:var(--green);font-weight:700">' + row.mtp_best_tps.toFixed(1) + ' t/s</span></div>'
+              + '<div class="kv-row"><span>Best config</span><span>' + escHtml(bp) + '</span></div>'
+              + '<div class="kv-row"><span>Gain vs no-MTP</span><span style="font-weight:600;color:' + (row.mtp_gain_pct >= 0 ? 'var(--green)' : 'var(--red)') + '">'
+              + (row.mtp_gain_pct >= 0 ? '+' : '') + row.mtp_gain_pct.toFixed(1) + '%</span></div>'
+            : '<div class="kv-row"><span>MTP result</span><span class="na">No data</span></div>';
+        return '<div class="detail-section"><h4>MTP Draft Sweep</h4>' + mtpR + '</div>';
       }})()
     + '</div></td></tr>';
 
@@ -2951,6 +2989,10 @@ def _make_row(r: dict, all_benchmarks: list) -> dict:
     row.setdefault("ik_gain_vs_llama_pct", 0.0)
     row.setdefault("ik_best_label", "")
     row.setdefault("ik_available", False)
+    row.setdefault("mtp_best_tps", 0.0)
+    row.setdefault("mtp_gain_pct", 0.0)
+    row.setdefault("mtp_best_label", "")
+    row.setdefault("mtp_available", False)
 
     # Size fallback: if estimated_fp16_gb or current_bpw are missing, compute
     # actual file size in GB directly from model_path so the Size column isn't blank.

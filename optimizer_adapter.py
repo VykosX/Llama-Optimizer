@@ -113,6 +113,22 @@ PRESETS: dict[str, dict] = {
         "phases": ["gpu", "moe", "compute", "memory", "moe_audit", "compute_audit", "memory_audit", "ik_contrast"],
         "trials": {"compute": 60, "memory": 60, "compute_audit": 60, "memory_audit": 60},
     },
+    "mtp": {
+        "description": "MTP: standard phases + MTP draft sweep (MTP-capable models only). ~2–3h/model.",
+        "phases": ["gpu", "moe", "compute", "memory", "mtp_spec"],
+        "trials": {"compute": 60, "memory": 60},
+    },
+    "mtp_thorough": {
+        "description": "MTP thorough: full audits + MTP sweep. ~4–5h/model.",
+        "phases": ["gpu", "moe", "compute", "memory", "moe_audit", "compute_audit", "memory_audit", "mtp_spec"],
+        "trials": {"compute": 60, "memory": 60, "compute_audit": 60, "memory_audit": 60},
+    },
+    "full_plus": {
+        "description": "Full+: quality + IK contrast + MTP sweep — everything. ~5–6h/model.",
+        "phases": ["gpu", "moe", "compute", "memory", "moe_audit", "compute_audit",
+                   "memory_audit", "quality", "ik_contrast", "mtp_spec"],
+        "trials": {"compute": 60, "memory": 60, "compute_audit": 60, "memory_audit": 60, "quality": 80},
+    },
 }
 
 PRESET_NAMES = list(PRESETS.keys())  # auto-derived from PRESETS dict above
@@ -159,9 +175,13 @@ class ModelResult:
     phases_run: list[str] = field(default_factory=list)
     phases_results: dict = field(default_factory=dict)   # phase_name -> result dict
     no_jinja: bool = False
-    ik_best_tps: float = 0.0         # best TPS from IK contrast phase
-    ik_gain_vs_llama_pct: float = 0.0  # gain percentage vs vanilla llama.cpp
-    ik_best_label: str = ""           # which IK config won
+    ik_best_tps: float = 0.0
+    ik_gain_vs_llama_pct: float = 0.0
+    ik_best_label: str = ""
+    mtp_best_tps: float = 0.0        # best TPS from MTP sweep
+    mtp_gain_pct: float = 0.0        # gain vs no-MTP baseline
+    mtp_best_label: str = ""         # winning MTP config description
+    mtp_available: bool = False      # whether MTP was detected/forced
 
 
 # ---------------------------------------------------------------------------
@@ -1022,6 +1042,7 @@ def run_pipeline(
     ctx_recommended: Optional[int] = None,
     resume: bool = True,
     ik_server_path: Optional[str] = None,
+    force_mtp: bool = False,
 ) -> ModelResult:
     """Run the optimizer pipeline for one model.
 
@@ -1088,6 +1109,7 @@ def run_pipeline(
         max_threads=None,   # auto-detect
         no_jinja=(str(model_path) in _NO_JINJA_MODELS) or no_jinja,
         ik_server_path=ik_server_path or os.environ.get("IK_LLAMA_SERVER", ""),
+        force_mtp=force_mtp,
     )
     # Set context and multi-GPU flags for all phases
     _opt.NAKED_ENGINE["context"] = context_size
@@ -1335,9 +1357,7 @@ def run_pipeline(
                 phases_results["quality"] = _load_prior_result(results_dir, "quality") or {}
 
             elif phase == "ik_contrast":
-                # IK_llama.cpp contrast: benchmark IK vs best llama.cpp config.
-                # Only runs when IK_SERVER is configured (set via ik_server_path or
-                # IK_LLAMA_SERVER env var — handled in reinitialize() above).
+                # IK_llama.cpp contrast
                 if not _opt.IK_MODE:
                     print(f"\n  [ik_contrast] IK_llama.cpp not configured — skipping")
                 else:
@@ -1353,6 +1373,26 @@ def run_pipeline(
                         )
                         phases_run.append("ik_contrast")
                     phases_results["ik_contrast"] = _load_prior_result(results_dir, "ik_contrast") or {}
+
+            elif phase == "mtp_spec":
+                # MTP draft sweep — only for models with MTP heads or --force-mtp
+                _mtp_eligible = _opt.MTP_AVAILABLE or _opt.MTP_FORCE
+                if not _mtp_eligible:
+                    print(f"\n  [mtp_spec] Model has no MTP heads — skipping")
+                    print(f"             (Use --force-mtp to run anyway)")
+                else:
+                    _mtp_skip = resume and bool(_load_prior_result(results_dir, "mtp_spec"))
+                    if _mtp_skip and "mtp_spec" not in run_config.rerun_phases:
+                        print(f"  [resume] mtp_spec already complete — skipping")
+                        phases_results["mtp_spec"] = _load_prior_result(results_dir, "mtp_spec") or {}
+                    else:
+                        _opt.phase_mtp(
+                            locked_compute=compute_best or None,
+                            locked_moe=best_moe or None,
+                            locked_memory=memory_best or None,
+                        )
+                        phases_run.append("mtp_spec")
+                    phases_results["mtp_spec"] = _load_prior_result(results_dir, "mtp_spec") or {}
 
     except KeyboardInterrupt:
         status = "interrupted"
@@ -1380,10 +1420,8 @@ def run_pipeline(
             break
 
     # Extract IK contrast result
-    _ik_r = phases_results.get("ik_contrast", {})
-    _ik_best_tps = _ik_r.get("ik_best_tps", 0.0)
-    _ik_gain = _ik_r.get("ik_gain_vs_llama_pct", 0.0)
-    _ik_label = _ik_r.get("ik_best_label", "")
+    _ik_r  = phases_results.get("ik_contrast", {})
+    _mtp_r = phases_results.get("mtp_spec", {})
 
     return ModelResult(
         model_path=model_path,
@@ -1396,7 +1434,11 @@ def run_pipeline(
         phases_run=phases_run,
         phases_results=phases_results,
         no_jinja=(str(model_path) in _NO_JINJA_MODELS),
-        ik_best_tps=_ik_best_tps,
-        ik_gain_vs_llama_pct=_ik_gain,
-        ik_best_label=_ik_label,
+        ik_best_tps=_ik_r.get("ik_best_tps", 0.0),
+        ik_gain_vs_llama_pct=_ik_r.get("ik_gain_vs_llama_pct", 0.0),
+        ik_best_label=_ik_r.get("ik_best_label", ""),
+        mtp_best_tps=_mtp_r.get("mtp_best_tps", 0.0),
+        mtp_gain_pct=_mtp_r.get("mtp_gain_pct", 0.0),
+        mtp_best_label=str(_mtp_r.get("best_params", {}).get("spec_draft_n_max", "")),
+        mtp_available=bool(_mtp_r.get("mtp_available", False) or _mtp_r.get("mtp_force", False)),
     )
